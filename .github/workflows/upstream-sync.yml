@@ -119,7 +119,7 @@ jobs:
           display_report: 'true'
           # Deliberately wide on read-only shell + Write: the 2026-08-08 dry run logged 3 permission
           # denials for ordinary inspection commands, and `gh pr create --body-file` needs Write.
-          claude_args: '--allowedTools "Bash(git:*),Bash(gh pr create:*),Bash(gh pr edit:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(cat:*),Bash(ls:*),Bash(grep:*),Bash(head:*),Bash(tail:*),Read,Grep,Glob,Write"'
+          claude_args: '--model claude-opus-5 --allowedTools "Bash(git:*),Bash(gh pr create:*),Bash(gh pr edit:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(cat:*),Bash(ls:*),Bash(grep:*),Bash(head:*),Bash(tail:*),Read,Grep,Glob,Write"'
           prompt: |
             You are reviewing an upstream sync for avargaskun/ladder, a fork of everywall/ladder.
 
@@ -159,7 +159,7 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           display_report: 'true'
-          claude_args: '--allowedTools "Bash(git:*),Read,Grep,Glob"'
+          claude_args: '--model claude-opus-5 --allowedTools "Bash(git:*),Read,Grep,Glob"'
           prompt: |
             DRY RUN for avargaskun/ladder's upstream-sync workflow. Open no PR, push nothing,
             commit nothing. Produce the review only.
