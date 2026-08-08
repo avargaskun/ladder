@@ -367,6 +367,10 @@ func rewriteHtml(bodyB []byte, u *url.URL, rule ruleset.Rule) string {
 	body = strings.ReplaceAll(body, "url('/", "url('"+proxyPrefix)
 	body = strings.ReplaceAll(body, "url(/", "url("+proxyPrefix)
 	body = strings.ReplaceAll(body, "href=\"https://"+u.Host, "href=\""+proxyPrefix)
+
+	if len(rulesSet) != 0 {
+		body = applyRules(body, rule)
+	}
 	return body
 }
 
@@ -402,19 +406,25 @@ func fetchRule(domain string, path string) ruleset.Rule {
 }
 
 func applyRules(body string, rule ruleset.Rule) string {
-	if len(rulesSet) == 0 {
+	for _, regexRule := range rule.RegexRules {
+		re, err := regexp.Compile(regexRule.Match)
+		if err != nil {
+			log.Printf("WARN: skipping invalid regexRule %q: %v", regexRule.Match, err)
+			continue
+		}
+		body = re.ReplaceAllString(body, regexRule.Replace)
+	}
+
+	if len(rule.Injections) == 0 {
 		return body
 	}
 
-	for _, regexRule := range rule.RegexRules {
-		re := regexp.MustCompile(regexRule.Match)
-		body = re.ReplaceAllString(body, regexRule.Replace)
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(body))
+	if err != nil {
+		log.Printf("WARN: injection skipped, could not parse document: %v", err)
+		return body
 	}
 	for _, injection := range rule.Injections {
-		doc, err := goquery.NewDocumentFromReader(strings.NewReader(body))
-		if err != nil {
-			log.Fatal(err)
-		}
 		if injection.Replace != "" {
 			doc.Find(injection.Position).ReplaceWithHtml(injection.Replace)
 		}
@@ -424,13 +434,14 @@ func applyRules(body string, rule ruleset.Rule) string {
 		if injection.Prepend != "" {
 			doc.Find(injection.Position).PrependHtml(injection.Prepend)
 		}
-		body, err = doc.Html()
-		if err != nil {
-			log.Fatal(err)
-		}
+	}
+	out, err := doc.Html()
+	if err != nil {
+		log.Printf("WARN: injection skipped, could not serialize document: %v", err)
+		return body
 	}
 
-	return body
+	return out
 }
 
 func StringInSlice(s string, list []string) bool {
