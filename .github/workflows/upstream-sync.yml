@@ -1,0 +1,173 @@
+name: upstream-sync
+
+# Weekly check for commits in everywall/ladder that this fork does not carry. When there are
+# any, they are merged onto a branch, Claude reviews the Go diff, and a PR is opened.
+#
+# Merge is ALWAYS manual here: this fork carries local patches in handlers/proxy.go
+# (rewriteHtml -> applyRules, fetchSite's guarded transport, the FlareSolverr client) and owns
+# handlers/safedial.go outright. Upstream churn in those places conflicts with us by design.
+#
+# Note: a PR opened with GITHUB_TOKEN does not trigger this repo's own ci.yml (GitHub's
+# workflow-recursion guard), so `go vet` / `go test` run in this job instead and their result is
+# reported in the PR body.
+
+on:
+  schedule:
+    - cron: '20 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      review_base:
+        description: 'Dry run: review the diff from this upstream ref (e.g. v0.0.22) to upstream/main and print the verdict. Opens no PR, pushes nothing.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/everywall/ladder.git 2>/dev/null \
+            || git remote set-url upstream https://github.com/everywall/ladder.git
+          git fetch --tags upstream
+
+      - name: Compute the upstream diff
+        id: diff
+        env:
+          REVIEW_BASE: ${{ inputs.review_base }}
+        run: |
+          set -euo pipefail
+          upstream_sha="$(git rev-parse upstream/main)"
+          if [ -n "$REVIEW_BASE" ]; then
+            base="$(git rev-parse "$REVIEW_BASE")"
+            dry=true
+          else
+            base="$(git merge-base HEAD upstream/main)"
+            dry=false
+          fi
+          git diff --stat "$base".."$upstream_sha" -- '*.go' go.mod go.sum Dockerfile > diffstat.txt
+          if [ -s diffstat.txt ]; then changed=true; else changed=false; fi
+          {
+            echo "upstream_sha=$upstream_sha"
+            echo "short_sha=${upstream_sha:0:7}"
+            echo "base=$base"
+            echo "dry=$dry"
+            echo "changed=$changed"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### upstream-sync"
+            echo ""
+            echo "- upstream/main: \`$upstream_sha\`"
+            echo "- diff base: \`$base\`"
+            echo "- dry run: \`$dry\`"
+            echo ""
+            if [ "$changed" = true ]; then cat diffstat.txt; else echo "No Go/Dockerfile changes upstream — nothing to do."; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -f diffstat.txt
+
+      - uses: actions/setup-go@v5
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'false'
+        with:
+          go-version-file: go.mod
+
+      - name: Merge upstream onto a branch
+        id: merge
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'false'
+        env:
+          SHORT_SHA: ${{ steps.diff.outputs.short_sha }}
+          UPSTREAM_SHA: ${{ steps.diff.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          branch="upstream-sync/$SHORT_SHA"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -b "$branch"
+          if git merge --no-edit upstream/main; then
+            conflicts=false
+          else
+            # Commit the conflict markers deliberately: the PR is a review vehicle that is never
+            # auto-merged, and a branch that fails to build is the loudest possible "resolve me".
+            conflicts=true
+            git add -A
+            git commit -m "chore: merge upstream $SHORT_SHA (CONFLICTS - unresolved markers committed)"
+          fi
+          if go vet ./... && go test ./...; then tests=pass; else tests=fail; fi
+          git push origin "$branch"
+          {
+            echo "branch=$branch"
+            echo "conflicts=$conflicts"
+            echo "tests=$tests"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Claude review + PR
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'false'
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          display_report: 'true'
+          claude_args: '--allowedTools "Bash(git:*),Bash(gh pr create:*),Bash(gh pr list:*),Bash(gh pr view:*),Read,Grep,Glob"'
+          prompt: |
+            You are reviewing an upstream sync for avargaskun/ladder, a fork of everywall/ladder.
+
+            Facts about this run:
+            - upstream/main is ${{ steps.diff.outputs.upstream_sha }}
+            - the diff base is ${{ steps.diff.outputs.base }}
+            - the merge branch ${{ steps.merge.outputs.branch }} is already created, committed and pushed
+            - merge conflicts: ${{ steps.merge.outputs.conflicts }}
+            - `go vet ./... && go test ./...` on the merged branch: ${{ steps.merge.outputs.tests }}
+
+            Do NOT commit, amend or push anything. The branch is final; your job is review and the PR.
+
+            1. Read the upstream changes with:
+               git diff ${{ steps.diff.outputs.base }}..${{ steps.diff.outputs.upstream_sha }} -- '*.go' go.mod go.sum Dockerfile
+            2. Review them for behavior and security changes: new outbound requests, changes to how
+               the target URL is parsed or fetched, header/cookie handling, dependency bumps.
+            3. THE FORK'S LOCAL PATCHES ARE THE POINT OF THIS REVIEW. Flag loudly, at the top of the
+               PR body, any upstream change touching:
+                 - handlers/proxy.go          (we restored the applyRules call and hardened it)
+                 - handlers/safedial.go       (ours outright: the dial-time SSRF guard)
+                 - rewriteHtml, applyRules    (the F4 fix lives here)
+                 - fetchSite's http.Client    (must keep Transport: safeTransport)
+                 - getFlareSolverrCookies     (must keep the UNGUARDED default transport, or
+                                               FlareSolverr breaks: it lives on a private address)
+               For each, say explicitly whether the upstream change preserves or undoes our patch.
+            4. Open the pull request with `gh pr create --base main --head ${{ steps.merge.outputs.branch }}`.
+               Title it as a conventional commit: `feat: sync upstream ${{ steps.diff.outputs.short_sha }}`
+               for behavior additions, `fix: sync upstream ${{ steps.diff.outputs.short_sha }}` otherwise.
+               Body = your review, starting with a one-line verdict (SAFE / NEEDS ATTENTION), then the
+               conflict and test status above, then the per-area findings.
+            5. Do NOT merge and do NOT enable auto-merge. A human decides on Go source.
+
+      - name: Claude dry-run review (no PR)
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          display_report: 'true'
+          claude_args: '--allowedTools "Bash(git:*),Read,Grep,Glob"'
+          prompt: |
+            DRY RUN for avargaskun/ladder's upstream-sync workflow. Open no PR, push nothing,
+            commit nothing. Produce the review only.
+
+            Read the diff with:
+              git diff ${{ steps.diff.outputs.base }}..${{ steps.diff.outputs.upstream_sha }} -- '*.go' go.mod go.sum Dockerfile
+
+            Review it for behavior and security changes, and flag loudly any change touching
+            handlers/proxy.go, handlers/safedial.go, rewriteHtml, applyRules, fetchSite's http.Client
+            or getFlareSolverrCookies — this fork carries local patches in exactly those places
+            (restored applyRules call, dial-time SSRF guard, guarded transport on fetchSite only).
+
+            Output a one-line verdict (SAFE / NEEDS ATTENTION) followed by the findings.
