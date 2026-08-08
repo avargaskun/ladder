@@ -1,13 +1,18 @@
 package handlers
 
 import (
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 
 	"ladder/pkg/ruleset"
 
+	"github.com/gofiber/fiber/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 )
 
@@ -145,4 +150,170 @@ func TestRewriteHtmlNoRulesetLeavesBodyAlone(t *testing.T) {
 	got := rewriteHtml([]byte(sampleHTML), mustParseURL(t, "https://example.com/"), rule)
 	assert.NotContains(t, got, "LADDER-INJECTION-CANARY")
 	assert.True(t, strings.Contains(got, "Example Domain"))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: SSRF guard, FlareSolverr exemption, extractUrl contract
+// ---------------------------------------------------------------------------
+
+func TestIsDisallowedIP(t *testing.T) {
+	blocked := []string{
+		"127.0.0.1",
+		"::1",
+		"10.0.0.1",
+		"172.16.0.1",
+		"192.168.4.1",
+		"169.254.1.1",
+		"fc00::1",
+		"0.0.0.0",
+		// The CGNAT cases are the regression guard: they pass only because the
+		// guard knows about 100.64.0.0/10. An IsPrivate()-only implementation
+		// lets the whole tailnet through, traefik included.
+		"100.110.42.49",
+		"100.64.0.1",
+		"100.127.255.254",
+	}
+	allowed := []string{
+		"93.184.216.34",
+		"1.1.1.1",
+		"100.63.255.255",
+		"100.128.0.1",
+		"2606:2800:220:1:248:1893:25c8:1946",
+	}
+
+	for _, s := range blocked {
+		ip := net.ParseIP(s)
+		require.NotNil(t, ip, "could not parse %q", s)
+		assert.True(t, isDisallowedIP(ip), "expected %s to be disallowed", s)
+	}
+	for _, s := range allowed {
+		ip := net.ParseIP(s)
+		require.NotNil(t, ip, "could not parse %q", s)
+		assert.False(t, isDisallowedIP(ip), "expected %s to be allowed", s)
+	}
+}
+
+// The redirect chain needs no separate test: every hop is dialled through
+// safeDialContext, so a 302 to a private address fails exactly like this.
+func TestSafeTransportBlocksLoopback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: safeTransport}
+	resp, err := client.Get(srv.URL)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "blocked request to non-public address")
+}
+
+func TestSafeTransportBlocksHostnameResolvingToPrivate(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	u := mustParseURL(t, srv.URL)
+	byName := "http://localhost:" + u.Port() + "/"
+
+	client := &http.Client{Transport: safeTransport}
+	resp, err := client.Get(byName)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "blocked request to non-public address")
+}
+
+// Mis-wiring is the realistic failure mode, so assert it functionally: a
+// fetchSite whose client does not carry safeTransport happily fetches loopback.
+func TestFetchSiteUsesGuardedTransport(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("<html><body>should never be reachable</body></html>"))
+	}))
+	defer srv.Close()
+
+	body, _, _, err := fetchSite(srv.URL, nil)
+	require.Error(t, err)
+	assert.Empty(t, body)
+	assert.Contains(t, err.Error(), "blocked request to non-public address")
+}
+
+// The regression guard for the single most likely way to break FlareSolverr:
+// someone later "tidying up" by putting safeTransport on this client too.
+// FlareSolverr is a sibling container on a private address by design.
+func TestGetFlareSolverrCookiesReachesPrivateAddress(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"ok","solution":{"cookies":[{"name":"cf_clearance","value":"abc"}]}}`))
+	}))
+	defer srv.Close()
+
+	prev := flareSolverrHost
+	flareSolverrHost = srv.URL
+	t.Cleanup(func() { flareSolverrHost = prev })
+
+	got, err := getFlareSolverrCookies("https://example.com")
+	require.NoError(t, err)
+	assert.Equal(t, "cf_clearance=abc", got)
+}
+
+// extractUrlFromPath drives extractUrl through a real Fiber app so the "*"
+// param is populated exactly as it is in production.
+func extractUrlFromPath(t *testing.T, path string, headers map[string]string) (string, error) {
+	t.Helper()
+	app := fiber.New()
+	var got string
+	var gotErr error
+	app.Get("/*", func(c *fiber.Ctx) error {
+		got, gotErr = extractUrl(c)
+		return c.SendString("ok")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	return got, gotErr
+}
+
+func TestExtractUrlFullyEncoded(t *testing.T) {
+	got, err := extractUrlFromPath(t, "/https%3A%2F%2Fexample.com/article", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "https://example.com/article", got)
+}
+
+func TestExtractUrlSlashesEncodedOnly(t *testing.T) {
+	got, err := extractUrlFromPath(t, "/https:%2F%2Fexample.com/article", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "https://example.com/article", got)
+}
+
+// F1: the Traefik-collapsed form. Traefik normalises "//" to "/" in a path, so
+// an unencoded "https://example.com/..." arrives as "https:/example.com/...",
+// which parses to a URL with NO host - the request then fails. This asserts the
+// current, documented behaviour so the regression stays visible. The userscript
+// must never send this form; it must percent-encode the slashes.
+func TestExtractUrlCollapsedSlashesLosesHost(t *testing.T) {
+	got, err := extractUrlFromPath(t, "/https:/example.com/article", nil)
+	require.NoError(t, err)
+
+	u := mustParseURL(t, got)
+	assert.Equal(t, "https", u.Scheme)
+	assert.Equal(t, "", u.Host)
+}
+
+// F1b: a relative sub-resource is reconstructed from the Referer header.
+func TestExtractUrlRelativePathUsesReferer(t *testing.T) {
+	got, err := extractUrlFromPath(t, "/images/foobar.jpg", map[string]string{
+		"Referer": "http://ladder.vargas.casa/https://example.com/article",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "https://example.com/images/foobar.jpg", got)
 }

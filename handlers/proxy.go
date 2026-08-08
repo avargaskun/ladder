@@ -133,6 +133,12 @@ func extractUrl(c *fiber.Ctx) (string, error) {
 	return urlQuery.String(), nil
 }
 
+// flareSolverrClient deliberately uses the default transport, with no SSRF
+// guard: FlareSolverr is a sibling container on a private address, which
+// safeTransport would block. Its timeout is longer than the 60s maxTimeout we
+// ask FlareSolverr for, so FlareSolverr's own timeout fires first.
+var flareSolverrClient = &http.Client{Timeout: 75 * time.Second}
+
 // getFlareSolverrCookies retrieves cookies from FlareSolverr for the given URL
 func getFlareSolverrCookies(targetURL string) (string, error) {
 	if flareSolverrHost == "" {
@@ -150,7 +156,7 @@ func getFlareSolverrCookies(targetURL string) (string, error) {
 		return "", err
 	}
 
-	resp, err := http.Post(flareSolverrHost+"/v1", "application/json", bytes.NewBuffer(jsonData))
+	resp, err := flareSolverrClient.Post(flareSolverrHost+"/v1", "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", err
 	}
@@ -274,7 +280,8 @@ func fetchSite(urlpath string, queries map[string]string) (string, *http.Request
 
 	// Fetch the site
 	client := &http.Client{
-		Timeout: time.Second * time.Duration(defaultTimeout),
+		Timeout:   time.Second * time.Duration(defaultTimeout),
+		Transport: safeTransport,
 	}
 	req, _ := http.NewRequest("GET", url, nil)
 
