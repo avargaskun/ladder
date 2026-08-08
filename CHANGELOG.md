@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/avargaskun/ladder/compare/v1.0.0...v1.0.1) (2026-08-08)
+
+
+### Bug Fixes
+
+* keep proxied references resolvable through a slash-collapsing proxy ([da5c0a5](https://github.com/avargaskun/ladder/commit/da5c0a5241b28d425fdcbeddb9df1c9ec926a0f7))
+
 ## [1.0.0](https://github.com/avargaskun/ladder/compare/v0.0.23...v1.0.0) (2026-08-08)
 
 
