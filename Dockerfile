@@ -2,6 +2,7 @@
 ARG VERSION=build
 
 FROM golang:1.26 AS build
+ARG VERSION
 WORKDIR /go/src/ladder
 
 COPY . .
