@@ -317,3 +317,60 @@ func TestExtractUrlRelativePathUsesReferer(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "https://example.com/images/foobar.jpg", got)
 }
+
+// F7: the same-origin rewrite must percent-encode the scheme separator, or
+// every rewritten reference arrives at the backend Traefik-collapsed and
+// hostless (the failure TestExtractUrlCollapsedSlashesLosesHost pins down).
+func TestRewriteHtmlEncodesSchemeSeparator(t *testing.T) {
+	body := rewriteHtml([]byte(`<a href="/post/1">x</a><img src="/a.png"><link href="/a.css">`),
+		mustParseURL(t, "https://example.com/article"), ruleset.Rule{})
+
+	assert.NotContains(t, body, `"/https://`, "unencoded separator survives a slash-collapsing proxy only by luck")
+	assert.Contains(t, body, `href="/https%3A%2F%2Fexample.com/post/1"`)
+	assert.Contains(t, body, `src="/https%3A%2F%2Fexample.com/a.png"`)
+	assert.Contains(t, body, `href="/https%3A%2F%2Fexample.com/a.css"`)
+}
+
+// F8: a protocol-relative reference is cross-origin. Treating its leading "//"
+// as a root-relative path folds the asset onto the article's own host, where it
+// resolves to that site's soft-404 HTML - which a browser then refuses as a
+// stylesheet, rendering the whole page unstyled.
+func TestRewriteHtmlProtocolRelativeKeepsItsOwnHost(t *testing.T) {
+	body := rewriteHtml([]byte(`<link rel="stylesheet" href="//assets.cdn.net/main.css"><img src="//img.cdn.net/a.png">`),
+		mustParseURL(t, "https://example.com/article"), ruleset.Rule{})
+
+	assert.Contains(t, body, `href="/https%3A%2F%2Fassets.cdn.net/main.css"`)
+	assert.Contains(t, body, `src="/https%3A%2F%2Fimg.cdn.net/a.png"`)
+	assert.NotContains(t, body, "example.com//", "the CDN host was folded onto the article origin")
+}
+
+// The absolute same-origin form used to gain a stray slash after the host.
+func TestRewriteHtmlAbsoluteSameOriginHref(t *testing.T) {
+	body := rewriteHtml([]byte(`<a href="https://example.com/post/1">x</a><a href="https://example.com">home</a>`),
+		mustParseURL(t, "https://example.com/article"), ruleset.Rule{})
+
+	assert.Contains(t, body, `href="/https%3A%2F%2Fexample.com/post/1"`)
+	assert.Contains(t, body, `href="/https%3A%2F%2Fexample.com"`)
+	assert.NotContains(t, body, "example.com//")
+}
+
+// CSS url() references, quoted and bare, root- and protocol-relative.
+func TestRewriteHtmlCSSUrlRefs(t *testing.T) {
+	body := rewriteHtml([]byte(`a{background:url(/bg.png)}b{background:url('/c.png')}c{background:url(//cdn.net/d.png)}`),
+		mustParseURL(t, "https://example.com/article"), ruleset.Rule{})
+
+	assert.Contains(t, body, `url(/https%3A%2F%2Fexample.com/bg.png)`)
+	assert.Contains(t, body, `url('/https%3A%2F%2Fexample.com/c.png')`)
+	assert.Contains(t, body, `url(/https%3A%2F%2Fcdn.net/d.png)`)
+}
+
+// The rewritten form must survive the round trip back through extractUrl.
+func TestRewriteHtmlOutputRoundTripsThroughExtractUrl(t *testing.T) {
+	body := rewriteHtml([]byte(`<link href="//assets.cdn.net/main.css">`),
+		mustParseURL(t, "https://example.com/article"), ruleset.Rule{})
+
+	path := strings.TrimSuffix(strings.SplitN(body, `href="`, 2)[1], `">`)
+	got, err := extractUrlFromPath(t, path, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "https://assets.cdn.net/main.css", got)
+}

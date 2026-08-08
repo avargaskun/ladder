@@ -353,27 +353,59 @@ func fetchSite(urlpath string, queries map[string]string) (string, *http.Request
 	return body, req, resp, nil
 }
 
+var (
+	reProxyImg    = regexp.MustCompile(`<img\s+([^>]*\s+)?src="(/[^"]*)"`)
+	reProxyScript = regexp.MustCompile(`<script\s+([^>]*\s+)?src="(/[^"]*)"`)
+	reProxyHref   = regexp.MustCompile(`href="(/[^"]*)"`)
+	reProxyCSSURL = regexp.MustCompile(`url\((['"]?)(/[^)'"]*)`)
+)
+
+// proxyRef maps a root-relative ("/a.css") or protocol-relative
+// ("//cdn.example.com/a.css") reference onto this proxy.
+//
+// The scheme separator is percent-encoded because reverse proxies collapse
+// duplicate slashes in a path: an emitted "/https://host/a.css" reaches the
+// backend as "/https:/host/a.css", which parses to a URL with no host.
+func proxyRef(host, ref string) string {
+	if strings.HasPrefix(ref, "//") {
+		// Cross-origin. Folding this onto host would point every CDN asset at
+		// the article's own origin, where it resolves to a soft-404 HTML page.
+		return basePath + "/https%3A%2F%2F" + strings.TrimPrefix(ref, "//")
+	}
+	return basePath + "/https%3A%2F%2F" + host + ref
+}
+
+// rewriteRefs rewrites the URL captured by the last group of re, leaving every
+// other captured group in place.
+func rewriteRefs(body string, re *regexp.Regexp, host string, render func(groups []string, proxied string) string) string {
+	return re.ReplaceAllStringFunc(body, func(match string) string {
+		groups := re.FindStringSubmatch(match)
+		return render(groups, proxyRef(host, groups[len(groups)-1]))
+	})
+}
+
 func rewriteHtml(bodyB []byte, u *url.URL, rule ruleset.Rule) string {
 	// Rewrite the HTML
 	body := string(bodyB)
 
-	proxyPrefix := basePath + "/https://" + u.Host + "/"
-
 	// images
-	imagePattern := `<img\s+([^>]*\s+)?src="(/)([^"]*)"`
-	re := regexp.MustCompile(imagePattern)
-	body = re.ReplaceAllString(body, fmt.Sprintf(`<img $1 src="%s$3"`, proxyPrefix))
+	body = rewriteRefs(body, reProxyImg, u.Host, func(g []string, p string) string {
+		return fmt.Sprintf(`<img %s src="%s"`, g[1], p)
+	})
 
 	// scripts
-	scriptPattern := `<script\s+([^>]*\s+)?src="(/)([^"]*)"`
-	reScript := regexp.MustCompile(scriptPattern)
-	body = reScript.ReplaceAllString(body, fmt.Sprintf(`<script $1 script="%s$3"`, proxyPrefix))
+	body = rewriteRefs(body, reProxyScript, u.Host, func(g []string, p string) string {
+		return fmt.Sprintf(`<script %s script="%s"`, g[1], p)
+	})
 
 	// body = strings.ReplaceAll(body, "srcset=\"/", "srcset=\""+proxyPrefix) // TODO: Needs a regex to rewrite the URL's
-	body = strings.ReplaceAll(body, "href=\"/", "href=\""+proxyPrefix)
-	body = strings.ReplaceAll(body, "url('/", "url('"+proxyPrefix)
-	body = strings.ReplaceAll(body, "url(/", "url("+proxyPrefix)
-	body = strings.ReplaceAll(body, "href=\"https://"+u.Host, "href=\""+proxyPrefix)
+	body = rewriteRefs(body, reProxyHref, u.Host, func(g []string, p string) string {
+		return fmt.Sprintf(`href="%s"`, p)
+	})
+	body = rewriteRefs(body, reProxyCSSURL, u.Host, func(g []string, p string) string {
+		return fmt.Sprintf(`url(%s%s`, g[1], p)
+	})
+	body = strings.ReplaceAll(body, "href=\"https://"+u.Host, "href=\""+basePath+"/https%3A%2F%2F"+u.Host)
 
 	if len(rulesSet) != 0 {
 		body = applyRules(body, rule)
