@@ -297,16 +297,21 @@ func TestExtractUrlSlashesEncodedOnly(t *testing.T) {
 
 // F1: the Traefik-collapsed form. Traefik normalises "//" to "/" in a path, so
 // an unencoded "https://example.com/..." arrives as "https:/example.com/...",
-// which parses to a URL with NO host - the request then fails. This asserts the
-// current, documented behaviour so the regression stays visible. The userscript
-// must never send this form; it must percent-encode the slashes.
-func TestExtractUrlCollapsedSlashesLosesHost(t *testing.T) {
+// hostless once parsed. extractUrl repairs it; clients should still send the
+// percent-encoded form, but a decoding hop upstream (an Authelia login round
+// trip re-decodes the path) can strip that encoding out of their control.
+func TestExtractUrlCollapsedSlashesRepaired(t *testing.T) {
 	got, err := extractUrlFromPath(t, "/https:/example.com/article", nil)
 	require.NoError(t, err)
+	assert.Equal(t, "https://example.com/article", got)
+}
 
-	u := mustParseURL(t, got)
-	assert.Equal(t, "https", u.Scheme)
-	assert.Equal(t, "", u.Host)
+// The exact shape the Authelia round trip produces (2026-08-14 incident): every
+// path-legal escape decoded, "?" left as %3F, "//" then collapsed by Traefik.
+func TestExtractUrlAutheliaRoundTripShapeRepaired(t *testing.T) {
+	got, err := extractUrlFromPath(t, "/https:/example.com/post/1%3Futm_medium=social&utm_campaign=x", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "https://example.com/post/1?utm_medium=social&utm_campaign=x", got)
 }
 
 // F1b: a relative sub-resource is reconstructed from the Referer header.
@@ -319,8 +324,8 @@ func TestExtractUrlRelativePathUsesReferer(t *testing.T) {
 }
 
 // F7: the same-origin rewrite must percent-encode the scheme separator, or
-// every rewritten reference arrives at the backend Traefik-collapsed and
-// hostless (the failure TestExtractUrlCollapsedSlashesLosesHost pins down).
+// every rewritten reference arrives at the backend Traefik-collapsed
+// (extractUrl now repairs that form, but only encoding is byte-stable).
 func TestRewriteHtmlEncodesSchemeSeparator(t *testing.T) {
 	body := rewriteHtml([]byte(`<a href="/post/1">x</a><img src="/a.png"><link href="/a.css">`),
 		mustParseURL(t, "https://example.com/article"), ruleset.Rule{})

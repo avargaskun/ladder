@@ -81,6 +81,12 @@ func init() {
 	}
 }
 
+// A proxy hop that percent-decodes the path (e.g. an Authelia login round trip)
+// re-exposes the scheme's "//" to Traefik's slash-collapsing, so the URL arrives
+// as "https:/host/..." — hostless once parsed. Repairable losslessly: a genuine
+// path can never start with "http(s):/".
+var collapsedSchemeRe = regexp.MustCompile(`^(https?):/([^/])`)
+
 // extracts a URL from the request ctx. If the URL in the request
 // is a relative path, it reconstructs the full URL using the referer header.
 func extractUrl(c *fiber.Ctx) (string, error) {
@@ -90,6 +96,8 @@ func extractUrl(c *fiber.Ctx) (string, error) {
 		// fallback
 		reqUrl = c.Params("*")
 	}
+
+	reqUrl = collapsedSchemeRe.ReplaceAllString(reqUrl, "$1://$2")
 
 	// Extract the actual path from req ctx
 	urlQuery, err := url.Parse(reqUrl)
