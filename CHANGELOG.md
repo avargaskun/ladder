@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.2](https://github.com/avargaskun/ladder/compare/v1.0.1...v1.0.2) (2026-08-14)
+
+
+### Bug Fixes
+
+* repair scheme slashes collapsed by an upstream decoding proxy hop ([ad72ef1](https://github.com/avargaskun/ladder/commit/ad72ef1025fe1583b6048c8db2a97d86f51b1536))
+
 ## [1.0.1](https://github.com/avargaskun/ladder/compare/v1.0.0...v1.0.1) (2026-08-08)
 
 
