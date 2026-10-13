@@ -11,9 +11,10 @@ name: upstream-sync
 # workflow-recursion guard), so `go vet` / `go test` run in this job instead and their result is
 # reported in the PR body.
 
+# No `schedule:` on purpose: GitHub disables scheduled workflows in a public repo after 60 days
+# without a push, and this repo is idle whenever upstream is. The weekly run is dispatched on main by
+# the n8n "GitHub Dispatch" workflow (unraid-agent: projects/n8n-workflows/github-dispatch).
 on:
-  schedule:
-    - cron: '20 9 * * 1'
   workflow_dispatch:
     inputs:
       review_base:
@@ -27,6 +28,8 @@ permissions:
 
 jobs:
   sync:
+    # Only main's copy of this file may run with this repo's secrets.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
