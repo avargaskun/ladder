@@ -109,16 +109,34 @@ func extractUrl(c *fiber.Ctx) (string, error) {
 
 	// eg: https://localhost:8080/images/foobar.jpg -> https://realsite.com/images/foobar.jpg
 	if isRelativePath {
+		// The path is on our own origin, so the only thing that says which
+		// site it belongs to is the referer. Without one there is nothing to
+		// resolve it against, and handing the path back unchanged only defers
+		// the failure to the HTTP client, which reports it as the unhelpful
+		// `unsupported protocol scheme ""`.
+		referer := c.Get("referer")
+		if referer == "" {
+			return "", fmt.Errorf("cannot resolve relative path '%s': request has no referer to resolve it against", reqUrl)
+		}
+
 		// Parse the referer URL from the request header.
-		refererUrl, err := url.Parse(c.Get("referer"))
+		refererUrl, err := url.Parse(referer)
 		if err != nil {
 			return "", fmt.Errorf("error parsing referer URL from req: '%s': %v", reqUrl, err)
 		}
 
-		// Extract the real url from referer path
-		realUrl, err := url.Parse(strings.TrimPrefix(refererUrl.Path, "/"))
+		// Extract the real url from referer path. Under BASE_PATH the proxied
+		// URL sits after the base path rather than at the root.
+		refererPath := strings.TrimPrefix(refererUrl.Path, basePath)
+		realUrl, err := url.Parse(strings.TrimPrefix(refererPath, "/"))
 		if err != nil {
 			return "", fmt.Errorf("error parsing real URL from referer '%s': %v", refererUrl.Path, err)
+		}
+
+		// A referer that is not itself a proxied page - the form at /, a bare
+		// origin, another site - carries no host to borrow.
+		if realUrl.Scheme == "" || realUrl.Host == "" {
+			return "", fmt.Errorf("cannot resolve relative path '%s': referer '%s' does not contain a proxied URL", reqUrl, referer)
 		}
 
 		// reconstruct the full URL using the referer's scheme, host, and the relative path / queries
@@ -138,14 +156,61 @@ func extractUrl(c *fiber.Ctx) (string, error) {
 
 	// default behavior:
 	// eg: https://localhost:8080/https://realsite.com/images/foobar.jpg -> https://realsite.com/images/foobar.jpg
+	if urlQuery.Scheme != "http" && urlQuery.Scheme != "https" {
+		return "", fmt.Errorf("cannot proxy request URL '%s': unsupported scheme '%s'", reqUrl, urlQuery.Scheme)
+	}
+	if urlQuery.Host == "" {
+		return "", fmt.Errorf("cannot proxy request URL '%s': no host", reqUrl)
+	}
 	return urlQuery.String(), nil
 }
 
+<<<<<<< HEAD
 // flareSolverrClient deliberately uses the default transport, with no SSRF
 // guard: FlareSolverr is a sibling container on a private address, which
 // safeTransport would block. Its timeout is longer than the 60s maxTimeout we
 // ask FlareSolverr for, so FlareSolverr's own timeout fires first.
 var flareSolverrClient = &http.Client{Timeout: 75 * time.Second}
+=======
+// staticAsset matches paths that are not pages. They are fetched directly,
+// because FlareSolverr's browser would return them wrapped in an HTML page.
+var staticAsset = regexp.MustCompile(`(?i)\.(css|js|mjs|map|json|xml|png|jpe?g|gif|webp|avif|svg|ico|bmp|woff2?|ttf|otf|eot|mp4|webm|mp3|m4a|pdf|zip)$`)
+
+// getFlareSolverrPage returns the page as FlareSolverr's browser loaded it.
+func getFlareSolverrPage(targetURL string) (string, int, error) {
+	if flareSolverrHost == "" {
+		return "", 0, fmt.Errorf("FLARESOLVERR_HOST environment variable not set")
+	}
+
+	reqBody := FlareSolverrRequest{
+		Cmd:        "request.get",
+		URL:        targetURL,
+		MaxTimeout: 60000,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", 0, err
+	}
+
+	resp, err := http.Post(flareSolverrHost+"/v1", "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+
+	var fsResp FlareSolverrResponse
+	if err := json.NewDecoder(resp.Body).Decode(&fsResp); err != nil {
+		return "", 0, err
+	}
+
+	if fsResp.Status != "ok" {
+		return "", 0, fmt.Errorf("FlareSolverr error: %s", fsResp.Message)
+	}
+
+	return fsResp.Solution.Response, fsResp.Solution.Status, nil
+}
+>>>>>>> upstream/main
 
 // getFlareSolverrCookies retrieves cookies from FlareSolverr for the given URL
 func getFlareSolverrCookies(targetURL string) (string, error) {
@@ -202,6 +267,7 @@ func ProxySite(rulesetPath string) fiber.Handler {
 		url, err := extractUrl(c)
 		if err != nil {
 			log.Println("ERROR In URL extraction:", err)
+			return c.Status(fiber.StatusBadRequest).SendString(err.Error())
 		}
 
 		queries := c.Queries()
@@ -286,6 +352,23 @@ func fetchSite(urlpath string, queries map[string]string) (string, *http.Request
 		return "", nil, nil, err
 	}
 
+	// For pages, return what FlareSolverr's browser loaded. Sites that
+	// fingerprint the client reject a refetch even with the solved cookies.
+	useFlareSolverr := rule.UseFlareSolverr && flareSolverrHost != "" && !staticAsset.MatchString(u.Path)
+	if useFlareSolverr {
+		page, status, err := getFlareSolverrPage(url)
+		if err == nil {
+			req, _ := http.NewRequest("GET", url, nil)
+			resp := &http.Response{StatusCode: status, Header: http.Header{}}
+			resp.Header.Set("Content-Type", "text/html; charset=utf-8")
+			if rule.Headers.CSP != "" {
+				resp.Header.Set("Content-Security-Policy", rule.Headers.CSP)
+			}
+			return rewriteHtml([]byte(page), u, rule), req, resp, nil
+		}
+		log.Printf("FlareSolverr page failed for %s, fetching directly: %v", url, err)
+	}
+
 	// Fetch the site
 	client := &http.Client{
 		Timeout:   time.Second * time.Duration(defaultTimeout),
@@ -319,7 +402,7 @@ func fetchSite(urlpath string, queries map[string]string) (string, *http.Request
 	cookieValue := rule.Headers.Cookie
 	debug := os.Getenv("LOG_URLS") == "true"
 
-	if rule.UseFlareSolverr && flareSolverrHost != "" {
+	if useFlareSolverr {
 		if fsCookies, err := getFlareSolverrCookies(url); err == nil {
 			if cookieValue != "" {
 				cookieValue = cookieValue + "; " + fsCookies
@@ -402,9 +485,15 @@ func rewriteHtml(bodyB []byte, u *url.URL, rule ruleset.Rule) string {
 	})
 
 	// scripts
+<<<<<<< HEAD
 	body = rewriteRefs(body, reProxyScript, u.Host, func(g []string, p string) string {
 		return fmt.Sprintf(`<script %s script="%s"`, g[1], p)
 	})
+=======
+	scriptPattern := `<script\s+([^>]*\s+)?src="(/)([^"]*)"`
+	reScript := regexp.MustCompile(scriptPattern)
+	body = reScript.ReplaceAllString(body, fmt.Sprintf(`<script $1 src="%s$3"`, proxyPrefix))
+>>>>>>> upstream/main
 
 	// body = strings.ReplaceAll(body, "srcset=\"/", "srcset=\""+proxyPrefix) // TODO: Needs a regex to rewrite the URL's
 	body = rewriteRefs(body, reProxyHref, u.Host, func(g []string, p string) string {
