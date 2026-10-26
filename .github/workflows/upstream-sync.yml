@@ -86,6 +86,8 @@ jobs:
         id: merge
         if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'false'
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           SHORT_SHA: ${{ steps.diff.outputs.short_sha }}
           UPSTREAM_SHA: ${{ steps.diff.outputs.upstream_sha }}
         run: |
@@ -93,29 +95,47 @@ jobs:
           branch="upstream-sync/$SHORT_SHA"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git checkout -b "$branch"
-          if git merge --no-edit upstream/main; then
-            conflicts=false
+          # Upstream unchanged since an earlier run: reuse its branch, since a fresh merge commit
+          # can never fast-forward onto it.
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            git fetch origin "$branch"
+            git checkout -b "$branch" FETCH_HEAD
+            if git log -1 --format=%s | grep -q CONFLICTS; then conflicts=true; else conflicts=false; fi
+            reused=true
           else
-            # Commit the conflict markers deliberately: the PR is a review vehicle that is never
-            # auto-merged, and a branch that fails to build is the loudest possible "resolve me".
-            conflicts=true
-            git add -A
-            git commit -m "chore: merge upstream $SHORT_SHA (CONFLICTS - unresolved markers committed)"
+            git checkout -b "$branch"
+            if git merge --no-edit upstream/main; then
+              conflicts=false
+            else
+              # Commit the conflict markers deliberately: the PR is a review vehicle that is never
+              # auto-merged, and a branch that fails to build is the loudest possible "resolve me".
+              conflicts=true
+              git add -A
+              git commit -m "chore: merge upstream $SHORT_SHA (CONFLICTS - unresolved markers committed)"
+            fi
+            reused=false
           fi
           if go vet ./... && go test ./...; then tests=pass; else tests=fail; fi
-          git push origin "$branch"
+          if [ "$reused" = false ]; then git push origin "$branch"; fi
+          if [ "$(gh pr list --head "$branch" --state open --json number --jq length)" -gt 0 ]; then
+            pr_open=true
+          else
+            pr_open=false
+          fi
           {
             echo "branch=$branch"
             echo "conflicts=$conflicts"
             echo "tests=$tests"
+            echo "pr_open=$pr_open"
           } >> "$GITHUB_OUTPUT"
 
       - name: Claude review + PR
-        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'false'
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'false' && steps.merge.outputs.pr_open == 'false'
         uses: anthropics/claude-code-action@v1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gh prefers a remote named `upstream`, so without this every gh call targets everywall/ladder.
+          GH_REPO: ${{ github.repository }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -154,6 +174,21 @@ jobs:
                Body = your review, starting with a one-line verdict (SAFE / NEEDS ATTENTION), then the
                conflict and test status above, then the per-area findings.
             5. Do NOT merge and do NOT enable auto-merge. A human decides on Go source.
+
+      - name: Require the PR
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ steps.merge.outputs.branch }}
+        run: |
+          set -euo pipefail
+          # The Claude step reports success even when it never opened the PR.
+          if [ "$(gh pr list --head "$BRANCH" --state open --json number --jq length)" -eq 0 ]; then
+            echo "::error::no open PR for $BRANCH"
+            exit 1
+          fi
+          gh pr list --head "$BRANCH" --state open --json url --jq '.[].url' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Claude dry-run review (no PR)
         if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'true'
